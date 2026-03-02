@@ -36,3 +36,15 @@ async def create_user(payload: dict = Body(...)):
         return {"status": "user created"}
     except Exception:
         return {"status": "user already exists"}
+       
+        @app.get("/add-test-user")
+async def add_test_user():
+    try:
+        await app.state.db.execute(
+            "INSERT INTO users (telegram_id, subscription) VALUES ($1, $2)",
+            999999,
+            "free"
+        )
+        return {"status": "test user added"}
+    except:
+        return {"status": "already exists"}
