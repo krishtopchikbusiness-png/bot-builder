@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Body
+from fastapi import FastAPI
 import asyncpg
 import os
 
@@ -21,23 +21,15 @@ async def home():
 
 @app.get("/users")
 async def get_users():
-    rows = await app.state.db.fetch("SELECT telegram_id, subscription FROM users ORDER BY id DESC")
-    return [{"telegram_id": r["telegram_id"], "subscription": r["subscription"]} for r in rows]
+    rows = await app.state.db.fetch(
+        "SELECT telegram_id, subscription FROM users ORDER BY id DESC"
+    )
+    return [
+        {"telegram_id": r["telegram_id"], "subscription": r["subscription"]}
+        for r in rows
+    ]
 
-@app.post("/create-user")
-async def create_user(payload: dict = Body(...)):
-    telegram_id = int(payload["telegram_id"])
-    try:
-        await app.state.db.execute(
-            "INSERT INTO users (telegram_id, subscription) VALUES ($1, $2)",
-            telegram_id,
-            "free"
-        )
-        return {"status": "user created"}
-    except Exception:
-        return {"status": "user already exists"}
-       
-        @app.get("/add-test-user")
+@app.get("/add-test-user")
 async def add_test_user():
     try:
         await app.state.db.execute(
