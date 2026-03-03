@@ -1,210 +1,118 @@
 """
-===========================================================
-ФАЙЛ: ui.py
-===========================================================
+ui.py
+ЗАЧЕМ:
+- Единое место, где мы делаем "экраны" builder-бота.
+- Тут же делаем твой эффект: при переходах можно УДАЛЯТЬ прошлое сообщение.
 
-ЗАЧЕМ ЭТОТ ФАЙЛ?
-
-Этот файл отвечает за "UI" (интерфейс) в Telegram:
-
-✅ "ЭФФЕКТ ИСЧЕЗНОВЕНИЯ"
-- когда юзер нажал кнопку → старые сообщения бота удаляются
-
-✅ УДАЛЕНИЕ НАПОМИНАНИЙ
-- если юзер нажал кнопку на напоминании → само напоминание тоже удалится
-
-✅ ОТПРАВКА "ЭКРАНОВ"
-- экран = текст + кнопки
-- мы отправляем экран и сохраняем message_id в базу,
-  чтобы потом удалить
-
-ВАЖНО:
-В этом файле НЕТ бизнес-логики.
-Тут нет тарифов, оплат, админки.
-Тут только удаление/отправка сообщений.
-===========================================================
+Как работает "удаляемый экран" в builder-боте:
+- Мы храним last_message_id в platform_state.
+- Перед показом нового экрана удаляем старое сообщение (если оно есть).
 """
 
-from typing import Optional
-from telegram import Update, InlineKeyboardMarkup
-from telegram.constants import ParseMode
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from telegram.ext import ContextTypes
-
 import db
 
-
-# =========================================================
-# 1) УДАЛЕНИЕ ОДНОГО СООБЩЕНИЯ (по message_id)
-# =========================================================
-
-async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
-    """
-    ЗАЧЕМ ЭТА ФУНКЦИЯ?
-
-    В Telegram нельзя всегда удалить сообщение:
-    - оно может быть слишком старым (редко)
-    - у бота может не быть прав (в группе)
-    - сообщение уже удалили
-
-    Поэтому делаем "safe delete":
-    пробуем удалить → если не получилось, молчим.
-    """
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        # Не спамим ошибками, просто игнорим
-        pass
-
-
-# =========================================================
-# 2) УДАЛЕНИЕ СООБЩЕНИЯ, ПО КОТОРОМУ НАЖАЛИ (callback)
-# =========================================================
-
-async def delete_clicked_message(update: Update):
-    """
-    ЗАЧЕМ ЭТА ФУНКЦИЯ?
-
-    Когда юзер нажимает кнопку, Telegram оставляет сообщение в чате.
-    Ты хотел: "нажал кнопку — сообщение исчезло".
-
-    Это значит:
-    - если это был экран → он удаляется
-    - если это было напоминание → оно тоже удаляется
-
-    Мы удаляем update.callback_query.message
-    """
-    q = update.callback_query
-    if not q or not q.message:
-        return
-
-    try:
-        await q.message.delete()
-    except Exception:
-        # Если удалить нельзя — хотя бы убираем кнопки, чтобы не нажимали 100 раз
+async def delete_last_screen_message(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = await db.get_platform_state(user_id)
+    last_id = state.get("last_message_id")
+    if last_id:
         try:
-            await q.edit_message_reply_markup(reply_markup=None)
+            await context.bot.delete_message(chat_id=chat_id, message_id=int(last_id))
         except Exception:
             pass
 
-
-# =========================================================
-# 3) УДАЛЕНИЕ ВСЕХ СООБЩЕНИЙ БОТА ДЛЯ ЮЗЕРА (wipe)
-# =========================================================
-
-async def wipe_bot_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    """
-    ЗАЧЕМ ЭТА ФУНКЦИЯ?
-
-    Это главный "эффект исчезновения".
-
-    Логика такая:
-    1) Мы заранее сохраняем в БД все message_id,
-       которые бот отправлял юзеру
-    2) Когда юзер делает действие (нажимает кнопку)
-       → удаляем все эти сообщения
-    3) Чистим таблицу bot_messages, чтобы список был пустой
-
-    РЕЗУЛЬТАТ:
-    В чате у юзера не копится мусор из экранов.
-    """
-    message_ids = db.get_bot_messages(user_id)
-
-    for mid in message_ids:
-        await safe_delete_message(context, chat_id, mid)
-
-    # После удаления — чистим список в базе
-    db.clear_bot_messages(user_id)
-
-
-# =========================================================
-# 4) ОТПРАВКА ЭКРАНА (текст + кнопки) + сохранение message_id
-# =========================================================
-
 async def send_screen(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
     user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
     text: str,
     keyboard: InlineKeyboardMarkup,
-    *,
-    wipe_before: bool = True,
-    delete_clicked: bool = True,
-    parse_mode: str = ParseMode.HTML,
-    disable_preview: bool = True,
-):
+    delete_prev: bool = True,
+) -> Message:
     """
-    ЭТО САМАЯ ВАЖНАЯ ФУНКЦИЯ UI.
-
-    ЧТО ОНА ДЕЛАЕТ:
-    1) (опционально) удаляет сообщение, по которому нажали
-       delete_clicked=True → сообщение с кнопкой исчезает
-    2) (опционально) удаляет ВСЕ старые сообщения бота
-       wipe_before=True → остается только 1 новый экран
-    3) отправляет новый экран
-    4) сохраняет message_id в базу, чтобы потом его удалить
-
-    ЗАЧЕМ ПАРАМЕТРЫ:
-    - wipe_before: иногда тебе надо НЕ удалять старые экраны (редко)
-    - delete_clicked: иногда кнопка может быть "без удаления" (ты просил выбор)
+    delete_prev=True → удаляем предыдущее сообщение builder-бота (эффект "исчезновения")
     """
+    if delete_prev:
+        await delete_last_screen_message(chat_id, user_id, context)
 
-    chat_id = update.effective_chat.id
-
-    # 1) удаляем сообщение по которому нажали (если это callback)
-    if delete_clicked and update.callback_query:
-        await delete_clicked_message(update)
-
-    # 2) удаляем все старые экраны бота (эффект исчезновения)
-    if wipe_before:
-        await wipe_bot_messages(context, chat_id, user_id)
-
-    # 3) отправляем новый экран
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=keyboard,
-        parse_mode=parse_mode,
-        disable_web_page_preview=disable_preview,
+        disable_web_page_preview=True,
+        parse_mode="HTML"
     )
 
-    # 4) сохраняем id сообщения чтобы потом удалить
-    db.add_bot_message(user_id, msg.message_id)
-
+    await db.set_platform_state(user_id, last_message_id=msg.message_id)
     return msg
 
+def kb_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 Мои боты", callback_data="nav:my_bots")],
+        [InlineKeyboardButton("➕ Подключить бота", callback_data="nav:connect_bot")],
+    ])
 
-# =========================================================
-# 5) ОТПРАВКА НАПОМИНАНИЯ (оно тоже должно удаляться потом)
-# =========================================================
+def kb_back_and_home(back_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⬅ Назад", callback_data=back_cb),
+            InlineKeyboardButton("🏠 Главное меню", callback_data="nav:main"),
+        ]
+    ])
 
-async def send_reminder(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    text: str,
-    keyboard: InlineKeyboardMarkup,
-    *,
-    parse_mode: str = ParseMode.HTML,
-    disable_preview: bool = True,
-):
-    """
-    ЗАЧЕМ ЭТА ФУНКЦИЯ?
+def kb_bots_list(bots: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for b in bots:
+        uname = b.get("bot_username") or "без username"
+        status = "✅ Опубликован" if b.get("published") else "📝 Черновик"
+        rows.append([InlineKeyboardButton(f"🤖 @{uname} • {status}", callback_data=f"bot:open:{b['id']}")])
+    rows.append([InlineKeyboardButton("➕ Подключить бота", callback_data="nav:connect_bot")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="nav:main")])
+    return InlineKeyboardMarkup(rows)
 
-    Напоминание — это обычное сообщение бота.
-    Ты хотел, чтобы:
-    ✅ оно тоже удалялось при следующем действии
-    ✅ и удалялось сразу, если юзер нажал кнопку прямо на напоминании
+def kb_open_bot(bot_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧩 Конструктор (блоки)", callback_data=f"flow:open:{bot_id}")],
+        [InlineKeyboardButton("🚀 Опубликовать", callback_data=f"bot:publish:{bot_id}")],
+        [InlineKeyboardButton("⬅ Назад", callback_data="nav:my_bots")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:main")],
+    ])
 
-    Поэтому:
-    - мы его отправляем
-    - сохраняем message_id в базу как обычный экран
-    """
-    msg = await context.bot.send_message(
-        chat_id=user_id,
-        text=text,
-        reply_markup=keyboard,
-        parse_mode=parse_mode,
-        disable_web_page_preview=disable_preview,
-    )
+def kb_flow_home(bot_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Новый блок", callback_data=f"flow:new_block:{bot_id}")],
+        [InlineKeyboardButton("📋 Список блоков", callback_data=f"flow:list_blocks:{bot_id}")],
+        [InlineKeyboardButton("⬅ Назад", callback_data=f"bot:open:{bot_id}")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:main")],
+    ])
 
-    db.add_bot_message(user_id, msg.message_id)
-    return msg
+def kb_blocks_list(bot_id: int, blocks: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for bl in blocks:
+        flag = "🟢 " if bl.get("is_start") else "🧱 "
+        delp = "🧽" if bl.get("delete_prev") else "📌"
+        rows.append([InlineKeyboardButton(f"{flag}{bl['title']} {delp}", callback_data=f"block:open:{bot_id}:{bl['id']}")])
+    rows.append([InlineKeyboardButton("➕ Новый блок", callback_data=f"flow:new_block:{bot_id}")])
+    rows.append([InlineKeyboardButton("⬅ Назад", callback_data=f"flow:open:{bot_id}")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="nav:main")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_block_editor(bot_id: int, block_id: int, delete_prev: bool) -> InlineKeyboardMarkup:
+    del_title = "🧽 Удалять предыдущее: ДА" if delete_prev else "📌 Удалять предыдущее: НЕТ"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Изменить текст", callback_data=f"block:edit_text:{bot_id}:{block_id}")],
+        [InlineKeyboardButton("➕ Добавить кнопку", callback_data=f"btn:add:{bot_id}:{block_id}")],
+        [InlineKeyboardButton(del_title, callback_data=f"block:toggle_del:{bot_id}:{block_id}")],
+        [InlineKeyboardButton("⬅ Назад", callback_data=f"flow:list_blocks:{bot_id}")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="nav:main")],
+    ])
+
+def kb_button_action_choose(bot_id: int, block_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➡️ Переход на блок", callback_data=f"btn:act:go_block:{bot_id}:{block_id}")],
+        [InlineKeyboardButton("🔗 Открыть ссылку", callback_data=f"btn:act:open_url:{bot_id}:{block_id}")],
+        [InlineKeyboardButton("✉️ Отправить текст", callback_data=f"btn:act:send_text:{bot_id}:{block_id}")],
+        [InlineKeyboardButton("⬅ Назад", callback_data=f"block:open:{bot_id}:{block_id}")],
+    ])
