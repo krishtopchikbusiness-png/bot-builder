@@ -30,6 +30,9 @@ ADMIN_IDS = set(
 GUMROAD_WEBHOOK_SECRET = os.getenv("GUMROAD_WEBHOOK_SECRET", "").strip()
 AUTO_MIGRATE = os.getenv("AUTO_MIGRATE", "0").strip() == "1"
 
+bot = Bot(BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher()
+
 # Ссылки на оплату (можешь потом заменить в переменных Railway)
 GUMROAD_URLS = {
     "lite": os.getenv("GUMROAD_LITE_URL", "").strip(),
@@ -1094,8 +1097,7 @@ async def on_startup():
         async with db_pool.acquire() as conn:
             await conn.execute(MIGRATION_SQL)
 
-    bot = Bot(BOT_TOKEN, parse_mode="HTML")
-    dp = Dispatcher()
+    
 
     # регистрируем хендлеры (ВАЖНО: dp уже используется декораторами, но в aiogram 3 так можно,
     # если dp создан ДО декораторов. Поэтому мы создали dp сверху как Optional,
