@@ -4,3 +4,5 @@ asyncpg
 aiogram==3.*
 python-dotenv
 aiohttp
+python-telegram-bot==21.6
+psycopg2-binary==2.9.9
