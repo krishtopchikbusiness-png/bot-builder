@@ -3,3 +3,7 @@ uvicorn[standard]
 asyncpg
 aiohttp
 python-dotenv
+aiogram==3.*
+SQLAlchemy==2.*
+pydantic
+pydantic-settings
