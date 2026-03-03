@@ -1,157 +1,343 @@
-# client.py
-# =========================================================
-# Зачем этот файл:
-# - здесь клиентский интерфейс (что видит пользователь)
-# - экраны, тексты, кнопки, переходы
-# - всё без админки/оплат пока (добавим позже отдельными файлами)
-# =========================================================
+"""
+===========================================================
+ФАЙЛ: client.py
+===========================================================
 
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
+ЗАЧЕМ ЭТОТ ФАЙЛ?
+
+Это "клиентская часть" бота:
+то есть всё, что видит обычный пользователь.
+
+Тут:
+- экраны
+- тексты
+- кнопки
+- логика переходов
+
+Тут НЕТ:
+- админ панели
+- оплат
+- тарифов
+- поддержки
+
+Мы специально разделяем, чтобы потом легко добавлять:
+admin.py, billing.py, support.py и т.д.
+===========================================================
+"""
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
+
 import db
 import ui
 
-# ---------- Тексты ----------
 
-START_TEXT = (
-    "🤖 <b>Конструктор ботов</b>\n\n"
+# =========================================================
+# 1) ТЕКСТЫ ЭКРАНОВ
+# =========================================================
+
+"""
+ВАЖНО:
+parse_mode=HTML в ui.send_screen включен.
+Значит ты можешь вставлять ссылки так:
+
+<a href="https://google.com">текст ссылки</a>
+
+и будет кликабельно.
+"""
+
+TEXT_HOME = (
+    "🧩 <b>Конструктор ботов</b>\n\n"
     "Выберите действие:"
 )
 
-MY_BOTS_TEXT = (
-    "🧩 <b>Мои боты</b>\n\n"
-    "Ниже список ваших ботов.\n"
+TEXT_MY_BOTS_EMPTY = (
+    "🤖 <b>Мои боты</b>\n\n"
+    "Пока пусто.\n"
+    "Нажмите «➕ Добавить бота»."
 )
 
-ADD_BOT_TEXT = (
+TEXT_ADD_BOT = (
     "➕ <b>Добавить бота</b>\n\n"
     "Отправьте одним сообщением:\n"
-    "<code>Название | ссылка</code>\n\n"
+    "<code>Название | @username_бота</code>\n\n"
     "Пример:\n"
-    "<code>Мой магазин | https://t.me/myshop_bot</code>"
+    "<code>Магазин | @my_shop_bot</code>\n\n"
+    "⚠️ Важно: пока это просто сохранение в список.\n"
+    "Автосоздание ботов добавим позже."
 )
 
-INVALID_TEXT = (
+TEXT_INVALID = (
     "❌ Неверный ввод.\n\n"
     "Нажмите «🏁 В начало»."
 )
 
-# ---------- Напоминания (пока 2 штуки, потом расширим) ----------
-REM_START = [(60, "⏳ Вы ещё тут? Выберите кнопку ниже."), (180, "🔔 Напоминание: выберите действие.")]
-REM_MYBOTS = [(60, "⏳ Хотите открыть или добавить бота?")]
 
-# ---------- Кнопки ----------
+# =========================================================
+# 2) КЛАВИАТУРЫ (кнопки)
+# =========================================================
 
-def kb_start():
+def kb_home():
+    """
+    Главная клавиатура.
+    callback_data начинаем с c: чтобы отличать клиентские кнопки.
+    """
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧩 Мои боты", callback_data="go:my_bots")],
-        [InlineKeyboardButton("➕ Добавить бота", callback_data="go:add_bot")],
+        [InlineKeyboardButton("🤖 Мои боты", callback_data="c:my_bots")],
+        [InlineKeyboardButton("➕ Добавить бота", callback_data="c:add_bot")],
+        [InlineKeyboardButton("👤 Профиль", callback_data="c:profile")],
     ])
 
-def kb_to_start():
+
+def kb_back_home():
+    """Кнопка возвращения в начало."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏁 В начало", callback_data="go:start")]
+        [InlineKeyboardButton("🏁 В начало", callback_data="c:home")]
     ])
 
-def kb_my_bots(rows):
-    # rows = list of (title, link)
-    buttons = []
-    for title, link in rows:
-        buttons.append([InlineKeyboardButton(f"🔗 {title}", url=link)])
-    buttons.append([InlineKeyboardButton("➕ Добавить бота", callback_data="go:add_bot")])
-    buttons.append([InlineKeyboardButton("🏁 В начало", callback_data="go:start")])
-    return InlineKeyboardMarkup(buttons)
 
-# ---------- Роутинг экранов ----------
+def kb_my_bots(bots: list[dict]):
+    """
+    Кнопки для списка ботов.
+    Если у бота есть username → делаем url-кнопку на открытие бота.
+    """
+    rows = []
 
-async def go_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, screen: str):
-    chat_id = update.effective_chat.id
+    # Список ботов
+    for b in bots[:20]:
+        name = b.get("bot_name", "Bot")
+        username = (b.get("bot_username") or "").strip()
+        if username.startswith("@"):
+            url = f"https://t.me/{username[1:]}"
+            rows.append([InlineKeyboardButton(f"🔗 {name}", url=url)])
+        else:
+            rows.append([InlineKeyboardButton(f"• {name}", callback_data="c:noop")])
 
-    # сохраняем экран
-    db.set_user_field(user_id, "last_screen", screen)
+    # Кнопки управления
+    rows.append([InlineKeyboardButton("➕ Добавить бота", callback_data="c:add_bot")])
+    rows.append([InlineKeyboardButton("🏁 В начало", callback_data="c:home")])
+    return InlineKeyboardMarkup(rows)
 
-    # отменяем старые напоминания
-    ui.cancel_reminders(context, user_id)
 
-    # показываем экран + ставим напоминания
-    if screen == "start":
-        await ui.send_screen(context, chat_id, user_id, START_TEXT, kb_start())
-        ui.schedule_reminders(context, user_id, chat_id, REM_START, kb_start())
+def kb_noop():
+    """Пустая кнопка-заглушка (чтобы не падало)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏁 В начало", callback_data="c:home")]
+    ])
+
+
+# =========================================================
+# 3) ЭКРАНЫ (функции, которые показывают текст+кнопки)
+# =========================================================
+
+async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Главный экран.
+    Здесь мы используем ui.send_screen, чтобы:
+    - удалить прошлые сообщения
+    - отправить новый экран
+    - сохранить message_id в БД (для удаления дальше)
+    """
+    u = update.effective_user
+    db.save_user(u.id, u.first_name or "", u.username or "")
+
+    await ui.send_screen(
+        update=update,
+        context=context,
+        user_id=u.id,
+        text=TEXT_HOME,
+        keyboard=kb_home(),
+        wipe_before=True,       # удалять старые экраны
+        delete_clicked=True,    # удалять сообщение, по которому нажали
+        parse_mode=ParseMode.HTML,
+        disable_preview=True,
+    )
+
+
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран профиля."""
+    u = update.effective_user
+    row = db.get_user(u.id) or {}
+
+    first_name = row.get("first_name", "")
+    username = row.get("username", "")
+    created_at = row.get("created_at", 0)
+
+    text = (
+        "👤 <b>Профиль</b>\n\n"
+        f"ID: <code>{u.id}</code>\n"
+        f"Имя: <b>{first_name}</b>\n"
+        f"Username: <b>@{username}</b>\n" if username else
+        "Username: —\n"
+    )
+
+    await ui.send_screen(
+        update=update,
+        context=context,
+        user_id=u.id,
+        text=text,
+        keyboard=kb_back_home(),
+        wipe_before=True,
+        delete_clicked=True,
+    )
+
+
+async def show_my_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран списка ботов пользователя."""
+    u = update.effective_user
+    bots = db.get_user_bots(u.id)
+
+    if not bots:
+        await ui.send_screen(
+            update=update,
+            context=context,
+            user_id=u.id,
+            text=TEXT_MY_BOTS_EMPTY,
+            keyboard=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить бота", callback_data="c:add_bot")],
+                [InlineKeyboardButton("🏁 В начало", callback_data="c:home")],
+            ]),
+            wipe_before=True,
+            delete_clicked=True,
+        )
         return
 
-    if screen == "my_bots":
-        bots = db.list_my_bots(user_id)
-        rows = [(b["title"], b["bot_link"]) for b in bots] if bots else []
-        text = MY_BOTS_TEXT
-        if not rows:
-            text += "\n— пока пусто. Нажмите «Добавить бота»."
-        await ui.send_screen(context, chat_id, user_id, text, kb_my_bots(rows))
-        ui.schedule_reminders(context, user_id, chat_id, REM_MYBOTS, kb_my_bots(rows))
-        return
+    text = "🤖 <b>Мои боты</b>\n\nНажмите на бота, чтобы открыть:"
+    await ui.send_screen(
+        update=update,
+        context=context,
+        user_id=u.id,
+        text=text,
+        keyboard=kb_my_bots(bots),
+        wipe_before=True,
+        delete_clicked=True,
+    )
 
-    if screen == "add_bot":
-        await ui.send_screen(context, chat_id, user_id, ADD_BOT_TEXT, kb_to_start())
-        return
 
-    await ui.send_screen(context, chat_id, user_id, INVALID_TEXT, kb_to_start())
+async def show_add_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Экран добавления бота.
+    После него пользователь должен отправить 1 сообщение:
+    "Название | @username"
+    """
+    u = update.effective_user
 
-# ---------- handlers ----------
+    # Запоминаем в базе что пользователь сейчас на экране add_bot
+    # (чтобы on_text понял, как обрабатывать ввод)
+    # Для этого используем поле last_screen? — его нет в этой db.py.
+    # Поэтому делаем проще: храним состояние в памяти (context.user_data).
+    context.user_data["screen"] = "add_bot"
+
+    await ui.send_screen(
+        update=update,
+        context=context,
+        user_id=u.id,
+        text=TEXT_ADD_BOT,
+        keyboard=kb_back_home(),
+        wipe_before=True,
+        delete_clicked=True,
+    )
+
+
+async def show_invalid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран 'Неверный ввод'."""
+    u = update.effective_user
+    await ui.send_screen(
+        update=update,
+        context=context,
+        user_id=u.id,
+        text=TEXT_INVALID,
+        keyboard=kb_back_home(),
+        wipe_before=True,
+        delete_clicked=True,
+    )
+
+
+# =========================================================
+# 4) HANDLERS (то что цепляется в main.py)
+# =========================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    db.upsert_user(u.id, u.first_name or "", u.username or "")
-    row = db.get_user(u.id)
-    if row and row["banned"]:
-        return
-
-    await go_screen(update, context, u.id, "start")
+    """
+    /start
+    Начинаем с главного экрана.
+    """
+    await show_home(update, context)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик всех нажатий на кнопки.
+    """
     q = update.callback_query
     await q.answer()
 
-    # удаляем сообщение, на котором нажали (в том числе напоминания)
-    await ui.delete_clicked_message(q)
+    data = q.data or ""
 
-    u = update.effective_user
-    db.upsert_user(u.id, u.first_name or "", u.username or "")
-    row = db.get_user(u.id)
-    if row and row["banned"]:
+    # Заглушка
+    if data == "c:noop":
+        await show_home(update, context)
         return
 
-    data = q.data
-    if data.startswith("go:"):
-        screen = data.split(":", 1)[1]
-        await go_screen(update, context, u.id, screen)
+    # Роутинг экранов
+    if data == "c:home":
+        await show_home(update, context)
+        return
+
+    if data == "c:profile":
+        await show_profile(update, context)
+        return
+
+    if data == "c:my_bots":
+        await show_my_bots(update, context)
+        return
+
+    if data == "c:add_bot":
+        await show_add_bot(update, context)
+        return
+
+    # если пришло что-то неизвестное
+    await show_invalid(update, context)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик обычных сообщений (не команд).
+
+    Тут мы обрабатываем ввод, когда пользователь на экране add_bot.
+    """
     u = update.effective_user
-    db.upsert_user(u.id, u.first_name or "", u.username or "")
-    row = db.get_user(u.id)
-    if row and row["banned"]:
-        return
+    db.save_user(u.id, u.first_name or "", u.username or "")
 
     text = (update.message.text or "").strip()
     if not text:
         return
 
-    # если пользователь на экране add_bot — принимаем формат "Название | ссылка"
-    if row and row["last_screen"] == "add_bot":
+    # Если пользователь на экране "add_bot", то ожидаем формат:
+    # Название | @username
+    if context.user_data.get("screen") == "add_bot":
+        context.user_data["screen"] = ""  # сбрасываем состояние
+
         if "|" not in text:
-            await ui.send_screen(context, update.effective_chat.id, u.id, INVALID_TEXT, kb_to_start())
+            await show_invalid(update, context)
             return
 
-        title, link = [x.strip() for x in text.split("|", 1)]
-        if not title or not link:
-            await ui.send_screen(context, update.effective_chat.id, u.id, INVALID_TEXT, kb_to_start())
+        name, username = [x.strip() for x in text.split("|", 1)]
+        if not name or not username:
+            await show_invalid(update, context)
             return
 
-        db.add_my_bot(u.id, title, link)
-        # после добавления — сразу в "Мои боты"
-        await go_screen(update, context, u.id, "my_bots")
+        # username должен быть типа @botname
+        if not username.startswith("@"):
+            await show_invalid(update, context)
+            return
+
+        db.add_user_bot(u.id, bot_name=name, bot_username=username)
+
+        # После добавления — сразу показываем список ботов
+        await show_my_bots(update, context)
         return
 
-    # иначе — неверный ввод
-    await ui.send_screen(context, update.effective_chat.id, u.id, INVALID_TEXT, kb_to_start())
+    # Если не в режиме ввода — это неверный ввод
+    await show_invalid(update, context)
