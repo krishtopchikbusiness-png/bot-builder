@@ -31,7 +31,7 @@ GUMROAD_WEBHOOK_SECRET = os.getenv("GUMROAD_WEBHOOK_SECRET", "").strip()
 AUTO_MIGRATE = os.getenv("AUTO_MIGRATE", "0").strip() == "1"
 
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
-    dp = Dispatcher()
+dp = Dispatcher()
 
 # Ссылки на оплату (можешь потом заменить в переменных Railway)
 GUMROAD_URLS = {
