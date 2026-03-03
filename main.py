@@ -30,7 +30,13 @@ ADMIN_IDS = set(
 GUMROAD_WEBHOOK_SECRET = os.getenv("GUMROAD_WEBHOOK_SECRET", "").strip()
 AUTO_MIGRATE = os.getenv("AUTO_MIGRATE", "0").strip() == "1"
 
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+from aiogram.client.default import DefaultBotProperties
+
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
+
 dp = Dispatcher()
 
 # Ссылки на оплату (можешь потом заменить в переменных Railway)
