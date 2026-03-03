@@ -1,90 +1,98 @@
 # ui.py
 # =========================================================
-# ЗАЧЕМ ЭТО:
-# - тут вся "магия исчезновения":
-#   1) бот помнит msg_id своих сообщений (db.bot_msgs)
-#   2) перед показом нового экрана удаляет старые
-# - тут единая функция send_screen(), чтобы клиент/админ
-#   показывали "экраны" одинаково
-# - тут удаление "нажатого" сообщения (кнопка → сообщение исчезло)
+# Зачем этот файл:
+# - вся "магия UI": удаление прошлых сообщений
+# - удаление сообщения по нажатию кнопки
+# - планирование/отмена напоминаний
 # =========================================================
 
 from telegram import InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
-from telegram.error import BadRequest
-
-import db as DB
+import db
 
 
-async def delete_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int):
-    """
-    ЗАЧЕМ:
-    - Telegram иногда не даёт удалить (уже удалено / плохой id)
-    - чтобы бот не падал с ошибкой
-    """
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-    except BadRequest:
-        # уже удалено / нельзя удалить — молча игнорим
-        pass
-    except Exception:
-        pass
+# ---------- Удаление сообщений (эффект исчезновения) ----------
+
+async def wipe_bot_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    ids = db.list_bot_msgs(user_id)
+    for mid in ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+    db.clear_bot_msgs(user_id)
 
 
-async def wipe_bot_messages(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int):
-    """
-    ЗАЧЕМ:
-    - "эффект исчезновения" экрана:
-      удаляем ВСЕ прошлые сообщения, которые бот слал пользователю
-    """
-    msg_ids = DB.get_bot_msgs(user_id, chat_id)
-    for mid in msg_ids:
-        await delete_message_safe(context, chat_id, mid)
-    DB.clear_bot_msgs(user_id, chat_id)
+async def send_screen(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
+                      text: str, kb: InlineKeyboardMarkup | None):
+    # 1) удаляем все старые сообщения бота
+    await wipe_bot_messages(context, chat_id, user_id)
 
-
-async def send_screen(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    chat_id: int,
-    text: str,
-    keyboard: InlineKeyboardMarkup,
-    *,
-    wipe: bool,
-    track: bool,
-    disable_preview: bool = True,
-):
-    """
-    ЗАЧЕМ:
-    - единый способ показывать "экран"
-    - wipe=True  -> перед показом удаляем старое (исчезновение)
-    - track=True -> запоминаем msg_id, чтобы удалить позже
-    """
-    if wipe:
-        await wipe_bot_messages(context, user_id, chat_id)
-
+    # 2) отправляем новый "экран"
     msg = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
-        reply_markup=keyboard,
-        parse_mode="HTML",
-        disable_web_page_preview=disable_preview,
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
     )
 
-    if track:
-        DB.add_bot_msg(user_id, chat_id, msg.message_id)
-
-    return msg
+    # 3) сохраняем msg_id, чтобы потом удалить
+    db.add_bot_msg(user_id, msg.message_id)
 
 
-async def delete_clicked_message(update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    ЗАЧЕМ:
-    - когда нажали кнопку, мы хотим, чтобы СТАРОЕ сообщение исчезло
-    - это отдельный эффект: исчезает именно сообщение с кнопкой
-    """
-    q = update.callback_query
-    if not q or not q.message:
+async def delete_clicked_message(query):
+    # удаляем сообщение, на котором была нажата кнопка (включая напоминания)
+    try:
+        await query.message.delete()
+    except Exception:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+# ---------- Напоминания (JobQueue) ----------
+
+def cancel_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    jq = getattr(context, "job_queue", None)
+    if not jq:
         return
-    await delete_message_safe(context, q.message.chat_id, q.message.message_id)
+    for job in list(jq.jobs()):
+        if job.name and job.name.startswith(f"rem_{user_id}_"):
+            job.schedule_removal()
 
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    user_id = data["user_id"]
+    chat_id = data["chat_id"]
+    text = data["text"]
+    kb = data["kb"]
+
+    # Напоминание тоже добавляем в bot_msgs, чтобы потом удалялось.
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+    db.add_bot_msg(user_id, msg.message_id)
+
+
+def schedule_reminders(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int,
+                       reminders: list[tuple[int, str]], kb: InlineKeyboardMarkup):
+    cancel_reminders(context, user_id)
+    jq = getattr(context, "job_queue", None)
+    if not jq:
+        return
+
+    for i, (sec, txt) in enumerate(reminders, start=1):
+        jq.run_once(
+            reminder_job,
+            when=sec,
+            name=f"rem_{user_id}_{i}",
+            data={"user_id": user_id, "chat_id": chat_id, "text": txt, "kb": kb},
+        )
