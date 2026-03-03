@@ -1,123 +1,95 @@
 """
-===========================================================
-ФАЙЛ: main.py
-===========================================================
+main.py
+ЗАЧЕМ:
+- FastAPI сервер на Railway.
+- При старте:
+  1) Подключает Postgres
+  2) Создаёт таблицы
+  3) Ставит webhook для builder-бота
+- Имеет 2 endpoint:
+  /tg/builder/<secret>              апдейты builder-бота (платформа)
+  /tg/client/<secret>/<bot_id>      апдейты клиентских ботов (которые подключили клиенты)
 
-ЗАЧЕМ ЭТОТ ФАЙЛ?
-
-Это главный файл запуска.
-
-Он делает 5 вещей:
-
-1) Берёт BOT_TOKEN из Railway Variables
-2) Инициализирует базу данных (создаёт таблицы)
-3) Подключает обработчики:
-   - /start
-   - нажатия кнопок (callback_data)
-   - обычные сообщения (текст)
-4) Запускает бота (polling)
-5) Ловит и печатает ошибки в лог Railway
-
-ВАЖНО:
-Мы запускаем polling (не webhook).
-Railway запускает файл как worker.
-===========================================================
+ЭТО = самый стабильный вариант для Railway.
 """
 
-import os
+from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 import db
-import client
+import builder
+import client_runtime
+from config import (
+    BOT_TOKEN,
+    DATABASE_URL,
+    BUILDER_WEBHOOK_PATH,
+    BUILDER_WEBHOOK_URL,
+    WEBHOOK_SECRET,
+)
 
+api = FastAPI()
+app: Application | None = None
 
-# =========================================================
-# 1) ЧИТАЕМ ТОКЕН
-# =========================================================
+@api.on_event("startup")
+async def on_startup():
+    global app
+    # 1) база
+    await db.init_pool(DATABASE_URL)
+    await db.init_db()
 
-"""
-ЗАЧЕМ?
+    # 2) builder-бот (платформа) — telegram application
+    app = Application.builder().token(BOT_TOKEN).build()
 
-Токен не пишем в код.
-Токен должен быть в Railway → Variables → BOT_TOKEN
-"""
+    # команды
+    app.add_handler(CommandHandler("start", builder.start))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("❌ Нет BOT_TOKEN в Railway Variables")
+    # кнопки
+    app.add_handler(CallbackQueryHandler(builder.on_callback))
 
+    # текстовые сообщения (ввод токена, создание блока, текст блока и т.д.)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, builder.on_text))
 
-# =========================================================
-# 2) ОБРАБОТЧИК ОШИБОК
-# =========================================================
+    # 3) запускаем приложение в фоне (для обработки update'ов вручную)
+    await app.initialize()
+    await app.start()
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # 4) ставим webhook для builder-бота
+    try:
+        await app.bot.set_webhook(url=BUILDER_WEBHOOK_URL)
+        print("✅ Builder webhook set:", BUILDER_WEBHOOK_URL)
+    except Exception as e:
+        print("❌ Не смог поставить webhook builder-боту:", e)
+
+@api.on_event("shutdown")
+async def on_shutdown():
+    global app
+    if app:
+        await app.stop()
+        await app.shutdown()
+
+@api.post(BUILDER_WEBHOOK_PATH)
+async def telegram_builder_webhook(request: Request):
     """
-    ЗАЧЕМ?
-
-    Если бот падает из-за ошибки,
-    Railway покажет её в логах.
-
-    Так мы быстро понимаем что сломалось.
+    Сюда Telegram присылает апдейты builder-бота.
     """
-    print("❌ ERROR:", context.error)
+    if app is None:
+        raise HTTPException(status_code=503, detail="Bot app not ready")
 
+    data = await request.json()
+    update = Update.de_json(data, app.bot)
+    await app.process_update(update)
+    return {"ok": True}
 
-# =========================================================
-# 3) MAIN — ЗАПУСК
-# =========================================================
-
-def main():
+@api.post(f"/tg/client/{WEBHOOK_SECRET}/{{bot_id}}")
+async def telegram_client_webhook(bot_id: int, request: Request):
     """
-    ЗАЧЕМ?
-
-    Эта функция запускается при старте контейнера Railway.
-
-    Внутри:
-    - создаём таблицы
-    - создаём приложение Telegram
-    - навешиваем handlers
-    - запускаем polling
+    Сюда Telegram присылает апдейты клиентских ботов (когда ты нажал Publish).
     """
+    data = await request.json()
+    await client_runtime.handle_client_update(bot_id, data)
+    return {"ok": True}
 
-    # 1) Инициализируем базу (создаём таблицы если их нет)
-    db.init_db()
-
-    # 2) Создаём приложение Telegram
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # 3) Команды
-    app.add_handler(CommandHandler("start", client.cmd_start))
-
-    # 4) Нажатия кнопок (callback_data)
-    # Мы ловим все кнопки, у которых callback_data начинается с "c:"
-    app.add_handler(CallbackQueryHandler(client.on_callback, pattern=r"^c:"))
-
-    # 5) Обычные сообщения пользователя (текст)
-    # Сюда попадёт всё, что не команда (/start и т.д.)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, client.on_text))
-
-    # 6) Ошибки
-    app.add_error_handler(error_handler)
-
-    print("✅ Bot started (polling)")
-
-    # 7) Запуск
-    app.run_polling(
-        drop_pending_updates=True,  # удаляет старые обновления, чтобы не спамило
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
-if __name__ == "__main__":
-    main()
-
-
+@api.get("/")
+async def root():
+    return {"status": "running"}
